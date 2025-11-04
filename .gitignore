@@ -24,6 +24,7 @@ Thumbs.db
 tmp/
 *.sqlite
 
-ai
+# Ignore only the top-level ai workspace, but keep feature code tracked
+/ai/
 lol
 lol2
