@@ -1,5 +1,8 @@
 # Trac AI Chat (P2P)
 
+<img width="1492" height="918" alt="image" src="https://github.com/user-attachments/assets/0642adef-2127-4d5b-9505-ae8333446eed" />
+
+
 This app runs a P2P chat contract where a single shared AI agent responds publicly when tagged with `@ai`. The AI is backed by a local REST model endpoint at the bootstrap's Oracle (Chat Completions API). The contract enforces ordered processing of messages and per-user rate limits.
 
 ## Requirements
@@ -58,6 +61,8 @@ pear run . store1
 ## How to chat
 
 Wait for the terminal/app to fully load before you try prompting (may take a while).
+
+By default, the app starts in desktop mode. To run it in terminal mode, edit the package.json file and replace index.js with index.html and terminal with desktop.
 
 In the terminal type your message like this:
 
