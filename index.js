@@ -31,7 +31,7 @@ peer_opts.api_msg_exposed = true;
 ///// FEATURES
 // Pass multiple features (aka oracles) to the peer and inject data into
 // your contract. Can also go the other way, depending on how you need it.
-// You may add as many FeatureI am s as you wish.
+// You may add as many FeatureI am in ps as you wish.
 // In /src/app.js, the Features are being executed by the admin (usually the Peer Bootstrap)
 const timer_opts = {};
 // Tighter interval for rate limiter precision
