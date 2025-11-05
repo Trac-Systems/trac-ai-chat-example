@@ -35,7 +35,12 @@ export class AiOracle extends Feature {
     this.apiKey = options.api_key || null;
     this.apiKeyHeader = options.api_key_header || 'Authorization';
     this.apiKeyScheme = options.api_key_scheme || 'Bearer';
+    // Inflight tracking: set of seq keys + timestamps and retry counters
     this.inflight = new Set();
+    this.inflightSince = new Map(); // key -> Date.now()
+    this.inflightRetries = new Map(); // key -> count
+    this.inflightTtlMs = (!isNaN(parseInt(options.inflight_ttl_ms))) ? parseInt(options.inflight_ttl_ms) : 30_000;
+    this.inflightMaxRetries = (!isNaN(parseInt(options.inflight_max_retries))) ? parseInt(options.inflight_max_retries) : 1;
   }
 
   async start(options = {}) {
@@ -89,6 +94,26 @@ export class AiOracle extends Feature {
           }
           const inflightKey = 'seq:'+next;
           if (this.inflight.has(inflightKey)) {
+            // TTL guard: if this inflight has been stuck too long, drop and optionally fast-forward after one retry
+            try {
+              const t0 = this.inflightSince.get(inflightKey) || 0;
+              const now = Date.now();
+              if (t0 && (now - t0) > this.inflightTtlMs) {
+                const retries = this.inflightRetries.get(inflightKey) || 0;
+                if (retries < this.inflightMaxRetries) {
+                  // Drop and retry once
+                  this.inflight.delete(inflightKey);
+                  this.inflightSince.delete(inflightKey);
+                  this.inflightRetries.set(inflightKey, retries + 1);
+                } else {
+                  // Give up on this seq and fast-forward pointer to unblock
+                  await this.append('ai_ctrl', { op: 'fast_forward', queue: 'tagged', seq: next });
+                  this.inflight.delete(inflightKey);
+                  this.inflightSince.delete(inflightKey);
+                  this.inflightRetries.delete(inflightKey);
+                }
+              }
+            } catch(_) {}
             await this.sleep(this.pollInterval);
             continue;
           }
@@ -115,6 +140,7 @@ export class AiOracle extends Feature {
 
           // Mark as inflight to avoid duplicate posts until contract advances process_seq
           this.inflight.add(inflightKey);
+          try { this.inflightSince.set(inflightKey, Date.now()); } catch(_){}
           
           // Build context
           const summaryObj = await this.peer.base.view.get('ai/summary');
@@ -281,6 +307,8 @@ export class AiOracle extends Feature {
           } catch(e) {
             // If posting fails, drop inflight and skip append to avoid deadlock
             this.inflight.delete(inflightKey);
+            this.inflightSince.delete(inflightKey);
+            this.inflightRetries.delete(inflightKey);
             throw e;
           }
 
@@ -293,9 +321,23 @@ export class AiOracle extends Feature {
             const trimmedReply = typeof aiText === 'string' ? aiText.slice(0, 2000) : '';
             const trimmedSummary = typeof newSummaryCandidate === 'string' ? newSummaryCandidate.slice(0, 2000) : '';
           await this.append('ai_result', { queue: 'tagged', seq: next, reply: trimmedReply, summary: trimmedSummary });
+            // Post-append confirmation: briefly wait for process_seq to advance past this seq
+            // Non-blocking safety net to help clear inflight faster on slow views
+            try {
+              let tries = 0;
+              while (tries < 6) { // ~1.5s @ 250ms steps
+                const psObj2 = await this.peer.base.view.get('process_seq');
+                const ps2 = psObj2 !== null ? parseInt(psObj2.value) : 0;
+                if (!isNaN(ps2) && ps2 >= next) break;
+                await this.sleep(250);
+                tries++;
+              }
+            } catch(_) {}
           } catch(e) {
             // If append fails, drop inflight so the item can be retried or fast-forwarded
             this.inflight.delete(inflightKey);
+            this.inflightSince.delete(inflightKey);
+            this.inflightRetries.delete(inflightKey);
             throw e;
           }
 
@@ -313,7 +355,11 @@ export class AiOracle extends Feature {
               const m = key.match(/^seq:(\d+)$/);
               if (m) {
                 const seq = parseInt(m[1]);
-                if (!isNaN(seq) && seq <= proc) this.inflight.delete(key);
+                if (!isNaN(seq) && seq <= proc) {
+                  this.inflight.delete(key);
+                  this.inflightSince.delete(key);
+                  this.inflightRetries.delete(key);
+                }
               }
             }
           }
