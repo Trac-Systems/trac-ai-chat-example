@@ -85,11 +85,15 @@ class AiChatProtocol extends Protocol {
                 return;
             }
             const lc = aiFeat.lastCall || null;
+            const attempts = Array.isArray(aiFeat.lastAttempts) ? aiFeat.lastAttempts : [];
             console.log('===== TEMP DIAG: AI LAST =====');
             if (!lc) {
                 console.log('No AI call recorded yet.');
             } else {
                 try { console.log(JSON.stringify(lc)); } catch(_) { console.log(lc); }
+            }
+            if (attempts.length > 0) {
+                try { console.log('recent_attempts:', JSON.stringify(attempts)); } catch(_) { console.log('recent_attempts:', attempts); }
             }
             console.log('================================');
         } catch(e){

@@ -41,8 +41,12 @@ export class AiOracle extends Feature {
     this.inflightRetries = new Map(); // key -> count
     this.inflightTtlMs = (!isNaN(parseInt(options.inflight_ttl_ms))) ? parseInt(options.inflight_ttl_ms) : 30_000;
     this.inflightMaxRetries = (!isNaN(parseInt(options.inflight_max_retries))) ? parseInt(options.inflight_max_retries) : 1;
+    this.requestTimeoutMs = (!isNaN(parseInt(options.request_timeout_ms))) ? parseInt(options.request_timeout_ms) : 60_000; // more lenient default
+    // Grace period to retry a fresh seq without emitting a busy message
+    this.warmupGraceMs = (!isNaN(parseInt(options.warmup_grace_ms))) ? parseInt(options.warmup_grace_ms) : 15_000;
     // Last AI call diagnostics (TEMP)
     this.lastCall = null;
+    this.lastCallEndedAt = 0;
   }
 
   async start(options = {}) {
@@ -61,6 +65,22 @@ export class AiOracle extends Feature {
       } catch(_) {}
       while(true){
         try {
+          // Gentle cooldown between calls to avoid immediate post-large-response spikes
+          const sinceLast = Date.now() - (this.lastCallEndedAt || 0);
+          const minCooldown = 1200; // ~1.2s default grace
+          if (sinceLast > 0 && sinceLast < minCooldown) {
+            await this.sleep(minCooldown - sinceLast);
+          }
+          // Gentle cooldown between calls to avoid immediate post-large-response spikes
+          try {
+            const sinceLastPrev = Date.now() - (this.lastCallEndedAt || 0);
+            const heavy = (this.lastCall && ((this.lastCall.elapsed_ms || 0) >= 5000 || (this.lastCall.payload_bytes || 0) >= 25000));
+            const baseCd = 1200;
+            const extraCd = heavy ? (1800 + Math.floor(Math.random()*400)) : 0;
+            const need = Math.max(0, baseCd - Math.max(0, sinceLastPrev), extraCd - Math.max(0, sinceLastPrev));
+            if (need > 0) await this.sleep(need);
+          } catch(_) {}
+
           // Read pointers for global queue (tagged + random types)
           const processSeqObj = await this.peer.base.view.get('process_seq');
           const messageSeqObj = await this.peer.base.view.get('message_seq');
@@ -160,6 +180,7 @@ export class AiOracle extends Feature {
           // Mark as inflight to avoid duplicate posts until contract advances process_seq
           this.inflight.add(inflightKey);
           try { this.inflightSince.set(inflightKey, Date.now()); } catch(_){}
+          const inflightStart = this.inflightSince.get(inflightKey) || Date.now();
           
           // Build context
           const summaryObj = await this.peer.base.view.get('ai/summary');
@@ -186,7 +207,7 @@ export class AiOracle extends Feature {
           }
 
           // Compose messages with a compact system preamble, short summary, history and current prompt
-          const systemPreamble = 'You are a true crypto chad who knows all ins and outs. trading, tech, everything. you are good with degens and speak their "language". respond briefly and longer if required but not overly excessive. avoid dashes in responses. avoid emojis. avoid hallucinating requests that you cannot fact check via web browsing in your responses.';
+          const systemPreamble = 'You are a true crypto chad who knows all ins and outs. trading, tech, everything. you are good with degens and speak their "language". respond briefly, no long explanations, keep it short. avoid dashes in responses. avoid emojis. avoid hallucinating requests that you cannot fact check via web browsing in your responses.';
           if(tokenizer.count(summary) > 512) {
             summary = summary.slice(0, 2048);
           }
@@ -232,7 +253,7 @@ export class AiOracle extends Feature {
 
           // Call local model
           // silent processing
-          const headers = { 'Content-Type': 'application/json', 'Connection': 'close' };
+          const headers = { 'Content-Type': 'application/json' };
           if (this.apiKey) {
             headers[this.apiKeyHeader] = (this.apiKeyHeader.toLowerCase() === 'authorization' && this.apiKeyScheme)
               ? `${this.apiKeyScheme} ${this.apiKey}`
@@ -278,28 +299,31 @@ export class AiOracle extends Feature {
               }
             }
 
-            // Select non-keepalive agent if possible (Node only; in browser/renderer this will be undefined)
-            let agent;
-            try {
-              const u = new URL(this.endpoint);
-              if (typeof process !== 'undefined' && process.versions && process.versions.node) {
-                if (u.protocol === 'https:') {
-                  const httpsMod = await import('https');
-                  agent = new (httpsMod.Agent || httpsMod.default?.Agent || httpsMod?.global?.Agent || httpsMod.Agent)({ keepAlive: false });
-                } else {
-                  const httpMod = await import('http');
-                  agent = new (httpMod.Agent || httpMod.default?.Agent || httpMod?.global?.Agent || httpMod.Agent)({ keepAlive: false });
-                }
-              }
-            } catch(_) { agent = undefined }
+            // Avoid keep-alive via header; do not pass Node agents into fetch in renderer contexts
+            // Do not pass Node-specific agents into fetch to maximize compatibility across runtimes
+            let agent = undefined;
 
             const startedAt = Date.now();
-            let res = await fetch(this.endpoint, {
+            // Helper: fetch with timeout; use AbortController when available (Node or modern runtimes), else race fallback
+            const fetchWithTimeout = async (url, opts, ms) => {
+              if (typeof AbortController !== 'undefined') {
+                const ctrl = new AbortController();
+                const id = setTimeout(() => { try { ctrl.abort(); } catch(_){} }, ms);
+                try {
+                  return await fetch(url, { ...opts, signal: ctrl.signal });
+                } finally { clearTimeout(id); }
+              } else {
+                return await new Promise((resolve, reject) => {
+                  const id = setTimeout(() => reject(new Error('timeout')), ms);
+                  fetch(url, opts).then(r => { clearTimeout(id); resolve(r) }).catch(e => { clearTimeout(id); reject(e) });
+                });
+              }
+            };
+            let res = await fetchWithTimeout(this.endpoint, {
               method: 'POST',
               headers,
-              body: JSON.stringify(msgBytesPayload),
-              agent
-            });
+              body: JSON.stringify(msgBytesPayload)
+            }, this.requestTimeoutMs);
             if(res.ok){
               const data = await res.json();
               aiText = (data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '';
@@ -312,137 +336,144 @@ export class AiOracle extends Feature {
                 messages_count: Array.isArray(messages) ? messages.length : null,
                 history_pairs_count: Array.isArray(historyPairs) ? historyPairs.length : null
               };
+              this.lastCallEndedAt = Date.now();
             } else {
               // TEMP LOG: surface reason for debugging (status + small body excerpt)
               try {
                 const txt = await res.text();
                 console.log('AiOracle HTTP non-OK:', res.status, (txt || '').slice(0, 200));
               } catch(_) {}
-              // One retry with a smaller context if server responds non-OK (e.g., token limits, bad model)
-              try {
-                const minimal = [
-                  { role: 'system', content: 'Be brief and helpful.' },
-                  { role: 'user', content: prompt.slice(0, 2000) }
-                ];
+              // Retry 1–3 times with minimal context before giving up with a friendly busy message
+              let success = false;
+              const minimal = [
+                { role: 'system', content: 'Be brief and helpful.' },
+                { role: 'user', content: prompt.slice(0, 2000) }
+              ];
+              const withinGrace = (Date.now() - (this.lastCallEndedAt || 0)) < 5000;
+              const silentStart = Date.now();
+              const silentCap = 12000;
+              for (let attempt = 0; attempt < 3 && !success; attempt++) {
                 const startedRetry = Date.now();
-                res = await fetch(this.endpoint, {
+                try {
+                  const resMin = await fetchWithTimeout(this.endpoint, {
+                    method: 'POST',
+                    headers,
+                    body: JSON.stringify({
+                      model: this.model,
+                      messages: minimal,
+                      stream: false,
+                      max_tokens: Math.min(256, this.maxReply),
+                      temperature: 0.7
+                    })
+                  }, this.requestTimeoutMs);
+                  if (resMin.ok) {
+                    const data2 = await resMin.json();
+                    aiText = (data2 && data2.choices && data2.choices[0] && data2.choices[0].message && data2.choices[0].message.content) || '';
+                    this.lastCall = {
+                      when: startedRetry,
+                      elapsed_ms: Date.now() - startedRetry,
+                      status: resMin.status,
+                      ok: true,
+                      payload_bytes: jsonSizeOf({ model: this.model, messages: minimal, stream: false, max_tokens: Math.min(256, this.maxReply), temperature: 0.7 }),
+                      messages_count: minimal.length,
+                      history_pairs_count: Array.isArray(historyPairs) ? historyPairs.length : null,
+                      note: `retry-minimal-after-non-ok-${attempt+1}`
+                    };
+                    this.lastCallEndedAt = Date.now();
+                    success = true;
+                    break;
+                  } else {
+                    try { const txt2 = await resMin.text(); console.log('AiOracle HTTP retry non-OK:', resMin.status, (txt2 || '').slice(0, 200)); } catch(_) {}
+                  }
+                } catch(eMin) { /* ignore and continue */ }
+                // Backoff more generously (e.g., 1s, 2s, 4s)
+                await this.sleep(1000 * Math.pow(2, attempt));
+                if (withinGrace && (Date.now() - silentStart) >= silentCap) break;
+              }
+              if (!success) {
+                const withinWarmup = (Date.now() - inflightStart) < this.warmupGraceMs;
+                if ((withinGrace && (Date.now() - silentStart) < silentCap) || withinWarmup) {
+                  // Drop inflight so we immediately retry this seq on the next loop
+                  this.inflight.delete(inflightKey);
+                  this.inflightSince.delete(inflightKey);
+                  await this.sleep(500);
+                  continue; // retry same seq on next iteration
+                } else {
+                  aiText = 'sorry, am busy please try again';
+                  this.lastCall = {
+                    when: Date.now(),
+                    elapsed_ms: null,
+                    ok: false,
+                    note: 'gave-up-after-retries-non-ok'
+                  };
+                  this.lastCallEndedAt = Date.now();
+                }
+              }
+            }
+          } catch(e) {
+            // Transport error (endpoint down/unreachable). Retry 1–3 times with minimal context and backoff, else friendly busy message
+            const headers2 = { ...headers };
+            const minimal = [
+              { role: 'system', content: 'Be brief and helpful.' },
+              { role: 'user', content: (prompt || '').slice(0, 2000) }
+            ];
+            let success2 = false;
+            const withinGrace2 = (Date.now() - (this.lastCallEndedAt || 0)) < 5000;
+            const silentStart2 = Date.now();
+            const silentCap2 = 12000;
+            for (let attempt = 0; attempt < 3 && !success2; attempt++) {
+              const startedRetry2 = Date.now();
+              try {
+                const res2 = await fetchWithTimeout(this.endpoint, {
                   method: 'POST',
-                  headers,
+                  headers: headers2,
                   body: JSON.stringify({
                     model: this.model,
                     messages: minimal,
                     stream: false,
                     max_tokens: Math.min(256, this.maxReply),
                     temperature: 0.7
-                  }),
-                  agent
-                });
-                if (res.ok) {
-                  const data2 = await res.json();
-                  aiText = (data2 && data2.choices && data2.choices[0] && data2.choices[0].message && data2.choices[0].message.content) || '';
+                  })
+                }, this.requestTimeoutMs);
+                if (res2.ok) {
+                  const data3 = await res2.json();
+                  aiText = (data3 && data3.choices && data3.choices[0] && data3.choices[0].message && data3.choices[0].message.content) || '';
                   this.lastCall = {
-                    when: startedRetry,
-                    elapsed_ms: Date.now() - startedRetry,
-                    status: res.status,
+                    when: startedRetry2,
+                    elapsed_ms: Date.now() - startedRetry2,
+                    status: res2.status,
                     ok: true,
-                    payload_bytes: jsonSizeOf({ model: this.model, messages: minimal, stream: false, max_tokens: Math.min(256, this.maxReply), temperature: 0.7 }),
+                    payload_bytes: JSON.stringify({ model: this.model, messages: minimal, stream: false, max_tokens: Math.min(256, this.maxReply), temperature: 0.7 }).length,
                     messages_count: minimal.length,
                     history_pairs_count: Array.isArray(historyPairs) ? historyPairs.length : null,
-                    note: 'retry-minimal-after-non-ok'
+                    note: `transport-retry-minimal-ok-${attempt+1}`
                   };
-                } else {
-                  try {
-                    const txt2 = await res.text();
-                    console.log('AiOracle HTTP retry non-OK:', res.status, (txt2 || '').slice(0, 200));
-                  } catch(_) {}
-                  aiText = 'Sorry, the AI endpoint failed.';
-                  this.lastCall = {
-                    when: startedRetry,
-                    elapsed_ms: Date.now() - startedRetry,
-                    status: res.status,
-                    ok: false,
-                    payload_bytes: jsonSizeOf({ model: this.model, messages: minimal, stream: false, max_tokens: Math.min(256, this.maxReply), temperature: 0.7 }),
-                    messages_count: minimal.length,
-                    history_pairs_count: Array.isArray(historyPairs) ? historyPairs.length : null,
-                    note: 'retry-minimal-non-ok'
-                  };
+                  this.lastCallEndedAt = Date.now();
+                  success2 = true;
+                  break;
                 }
-              } catch(_) {
-                aiText = 'Sorry, the AI endpoint failed.';
-              }
+              } catch(_) { /* ignored */ }
+              await this.sleep(1000 * Math.pow(2, attempt));
+              if (withinGrace2 && (Date.now() - silentStart2) >= silentCap2) break;
             }
-          } catch(e) {
-            // Transport error (endpoint down/unreachable). Retry once with minimal context and backoff
-            try {
-              await this.sleep(250);
-              const headers2 = { ...headers };
-              const minimal = [
-                { role: 'system', content: 'Be brief and helpful.' },
-                { role: 'user', content: (prompt || '').slice(0, 2000) }
-              ];
-              // New agent for retry as well
-              let agent2;
-              try {
-                const u2 = new URL(this.endpoint);
-                if (typeof process !== 'undefined' && process.versions && process.versions.node) {
-                  if (u2.protocol === 'https:') {
-                    const httpsMod2 = await import('https');
-                    agent2 = new (httpsMod2.Agent || httpsMod2.default?.Agent || httpsMod2?.global?.Agent || httpsMod2.Agent)({ keepAlive: false });
-                  } else {
-                    const httpMod2 = await import('http');
-                    agent2 = new (httpMod2.Agent || httpMod2.default?.Agent || httpMod2?.global?.Agent || httpMod2.Agent)({ keepAlive: false });
-                  }
-                }
-              } catch(_) { agent2 = undefined }
-              const startedRetry2 = Date.now();
-              const res2 = await fetch(this.endpoint, {
-                method: 'POST',
-                headers: headers2,
-                body: JSON.stringify({
-                  model: this.model,
-                  messages: minimal,
-                  stream: false,
-                  max_tokens: Math.min(256, this.maxReply),
-                  temperature: 0.7
-                }),
-                agent: agent2
-              });
-              if (res2.ok) {
-                const data3 = await res2.json();
-                aiText = (data3 && data3.choices && data3.choices[0] && data3.choices[0].message && data3.choices[0].message.content) || '';
-                this.lastCall = {
-                  when: startedRetry2,
-                  elapsed_ms: Date.now() - startedRetry2,
-                  status: res2.status,
-                  ok: true,
-                  payload_bytes: JSON.stringify({ model: this.model, messages: minimal, stream: false, max_tokens: Math.min(256, this.maxReply), temperature: 0.7 }).length,
-                  messages_count: minimal.length,
-                  history_pairs_count: Array.isArray(historyPairs) ? historyPairs.length : null,
-                  note: 'transport-retry-minimal-ok'
-                };
+            if (!success2) {
+              const withinWarmup2 = (Date.now() - inflightStart) < this.warmupGraceMs;
+              if ((withinGrace2 && (Date.now() - silentStart2) < silentCap2) || withinWarmup2) {
+                // Drop inflight so we immediately retry this seq on the next loop
+                this.inflight.delete(inflightKey);
+                this.inflightSince.delete(inflightKey);
+                await this.sleep(500);
+                continue; // retry same seq on next loop
               } else {
-                aiText = 'Sorry, the AI endpoint failed.';
+                aiText = 'sorry, am busy please try again';
                 this.lastCall = {
-                  when: startedRetry2,
-                  elapsed_ms: Date.now() - startedRetry2,
-                  status: res2.status,
+                  when: Date.now(),
+                  elapsed_ms: null,
                   ok: false,
-                  payload_bytes: JSON.stringify({ model: this.model, messages: minimal, stream: false, max_tokens: Math.min(256, this.maxReply), temperature: 0.7 }).length,
-                  messages_count: minimal.length,
-                  history_pairs_count: Array.isArray(historyPairs) ? historyPairs.length : null,
-                  note: 'transport-retry-minimal-non-ok'
+                  note: 'transport-exception-gave-up-after-retries'
                 };
+                this.lastCallEndedAt = Date.now();
               }
-            } catch(_) {
-              // Provide a graceful fallback reply instead of stalling the queue
-              aiText = 'Sorry, the AI endpoint is unreachable.';
-              this.lastCall = {
-                when: Date.now(),
-                elapsed_ms: null,
-                ok: false,
-                error: { name: e?.name || 'Error', message: e?.message || String(e) },
-                note: 'transport-exception'
-              };
             }
           }
 

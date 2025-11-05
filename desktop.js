@@ -379,7 +379,12 @@ function ChatApp(){
     const prepared = api.prepareMessage(text, peer.wallet.publicKey, null, []);
     const nonce = api.generateNonce();
     const signature = peer.wallet.sign(JSON.stringify(prepared) + nonce);
-    await api.post(prepared, signature, nonce);
+    try {
+      await api.post(prepared, signature, nonce);
+    } catch(e) {
+      console.log('Desktop post failed:', e?.message || e);
+      throw e;
+    }
   }
 
   const refreshAll = async () => {
