@@ -85,13 +85,22 @@ class AiChatContract extends Contract {
             const msg = _this.op.msg;
             if(typeof msg !== 'string') return;
 
+            // Trusted timestamp from timer feature (if available)
+            const now = await _this.get('currentTime');
+            if(now !== null){
+                // Store timestamp for this message index (pre-increment)
+                let idx = await _this.get('msgl');
+                idx = idx !== null ? parseInt(idx) : 0;
+                if(isNaN(idx)) idx = 0;
+                await _this.put('msgts/'+idx, now);
+            }
+
             // Skip messages that carry an AI-reply attachment marker (AI self messages)
             if(Array.isArray(_this.op.attachments) && _this.op.attachments.indexOf('ai-reply') !== -1) return;
 
             const lower = msg.toLowerCase();
             const containsAi = lower.indexOf('@ai') !== -1;
 
-            const now = await _this.get('currentTime');
             if(now === null) return; // no trusted time yet
 
             const addr = _this.address;

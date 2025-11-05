@@ -41,6 +41,8 @@ export class AiOracle extends Feature {
     this.inflightRetries = new Map(); // key -> count
     this.inflightTtlMs = (!isNaN(parseInt(options.inflight_ttl_ms))) ? parseInt(options.inflight_ttl_ms) : 30_000;
     this.inflightMaxRetries = (!isNaN(parseInt(options.inflight_max_retries))) ? parseInt(options.inflight_max_retries) : 1;
+    // Last AI call diagnostics (TEMP)
+    this.lastCall = null;
   }
 
   async start(options = {}) {
@@ -96,9 +98,26 @@ export class AiOracle extends Feature {
           if (this.inflight.has(inflightKey)) {
             // TTL guard: if this inflight has been stuck too long, drop and optionally fast-forward after one retry
             try {
-              const t0 = this.inflightSince.get(inflightKey) || 0;
+              let t0 = this.inflightSince.get(inflightKey);
               const now = Date.now();
-              if (t0 && (now - t0) > this.inflightTtlMs) {
+              // If we inherited an inflight from a previous version without since-tracking,
+              // initialize it now so TTL logic can start applying.
+              if (!t0) {
+                this.inflightSince.set(inflightKey, now);
+                t0 = now;
+              }
+              // Additionally, consider the age of the pending item using contract time to avoid clock skew
+              let ageMs = null;
+              try {
+                const ct = await this.peer.base.view.get('currentTime');
+                const currentTime = ct ? ct.value : null;
+                if (typeof currentTime === 'number' && typeof pendingObj.value?.timestamp === 'number') {
+                  ageMs = currentTime - pendingObj.value.timestamp;
+                }
+              } catch(_) {}
+              const ttlExceeded = (now - t0) > this.inflightTtlMs;
+              const pendingTooOld = (ageMs !== null) && (ageMs > (this.inflightTtlMs * 2));
+              if (ttlExceeded || pendingTooOld) {
                 const retries = this.inflightRetries.get(inflightKey) || 0;
                 if (retries < this.inflightMaxRetries) {
                   // Drop and retry once
@@ -213,7 +232,7 @@ export class AiOracle extends Feature {
 
           // Call local model
           // silent processing
-          const headers = { 'Content-Type': 'application/json' };
+          const headers = { 'Content-Type': 'application/json', 'Connection': 'close' };
           if (this.apiKey) {
             headers[this.apiKeyHeader] = (this.apiKeyHeader.toLowerCase() === 'authorization' && this.apiKeyScheme)
               ? `${this.apiKeyScheme} ${this.apiKey}`
@@ -221,27 +240,210 @@ export class AiOracle extends Feature {
           }
           let aiText = '';
           try {
-            const res = await fetch(this.endpoint, {
+            // Additional byte-size budget guard to complement token budget
+            const jsonSizeOf = (obj) => { try { return JSON.stringify(obj).length } catch(_) { return Number.MAX_SAFE_INTEGER } };
+            const maxJsonBytes = 256 * 1024; // ~256 KB
+            // Rebuild messages with bytes budget enforcement
+            const rebuild = () => [{ role: 'system', content: systemPreamble }, { role: 'system', content: messages[1].content }].concat(historyPairs).concat([{ role: 'user', content: messages[messages.length - 1].content }]);
+            let msgBytesPayload = { model: this.model, messages, stream: false, max_tokens: this.maxReply, temperature: 0.7 };
+            let size = jsonSizeOf(msgBytesPayload);
+            if (size > maxJsonBytes) {
+              // Drop history pairs first
+              while (historyPairs.length > 0 && size > maxJsonBytes) {
+                historyPairs.shift();
+                if (historyPairs.length > 0) historyPairs.shift();
+                messages = rebuild();
+                msgBytesPayload = { model: this.model, messages, stream: false, max_tokens: this.maxReply, temperature: 0.7 };
+                size = jsonSizeOf(msgBytesPayload);
+              }
+              // Trim summary aggressively if still too large
+              if (size > maxJsonBytes) {
+                let sys = messages[1].content;
+                while (sys.length > 64 && size > maxJsonBytes) {
+                  sys = sys.slice(0, Math.floor(sys.length * 0.8));
+                  messages[1].content = sys;
+                  msgBytesPayload = { model: this.model, messages, stream: false, max_tokens: this.maxReply, temperature: 0.7 };
+                  size = jsonSizeOf(msgBytesPayload);
+                }
+              }
+              // Trim current prompt if still too large
+              if (size > maxJsonBytes) {
+                let up = messages[messages.length - 1].content;
+                while (up.length > 64 && size > maxJsonBytes) {
+                  up = up.slice(0, Math.floor(up.length * 0.9));
+                  messages[messages.length - 1].content = up;
+                  msgBytesPayload = { model: this.model, messages, stream: false, max_tokens: this.maxReply, temperature: 0.7 };
+                  size = jsonSizeOf(msgBytesPayload);
+                }
+              }
+            }
+
+            // Select non-keepalive agent if possible (Node only; in browser/renderer this will be undefined)
+            let agent;
+            try {
+              const u = new URL(this.endpoint);
+              if (typeof process !== 'undefined' && process.versions && process.versions.node) {
+                if (u.protocol === 'https:') {
+                  const httpsMod = await import('https');
+                  agent = new (httpsMod.Agent || httpsMod.default?.Agent || httpsMod?.global?.Agent || httpsMod.Agent)({ keepAlive: false });
+                } else {
+                  const httpMod = await import('http');
+                  agent = new (httpMod.Agent || httpMod.default?.Agent || httpMod?.global?.Agent || httpMod.Agent)({ keepAlive: false });
+                }
+              }
+            } catch(_) { agent = undefined }
+
+            const startedAt = Date.now();
+            let res = await fetch(this.endpoint, {
               method: 'POST',
               headers,
-              body: JSON.stringify({
-                model: this.model,
-                messages,
-                stream: false,
-                max_tokens: this.maxReply,
-                temperature: 0.7
-              })
+              body: JSON.stringify(msgBytesPayload),
+              agent
             });
             if(res.ok){
               const data = await res.json();
               aiText = (data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '';
+              this.lastCall = {
+                when: startedAt,
+                elapsed_ms: Date.now() - startedAt,
+                status: res.status,
+                ok: true,
+                payload_bytes: size,
+                messages_count: Array.isArray(messages) ? messages.length : null,
+                history_pairs_count: Array.isArray(historyPairs) ? historyPairs.length : null
+              };
             } else {
-              aiText = 'Sorry, the AI endpoint failed.';
+              // TEMP LOG: surface reason for debugging (status + small body excerpt)
+              try {
+                const txt = await res.text();
+                console.log('AiOracle HTTP non-OK:', res.status, (txt || '').slice(0, 200));
+              } catch(_) {}
+              // One retry with a smaller context if server responds non-OK (e.g., token limits, bad model)
+              try {
+                const minimal = [
+                  { role: 'system', content: 'Be brief and helpful.' },
+                  { role: 'user', content: prompt.slice(0, 2000) }
+                ];
+                const startedRetry = Date.now();
+                res = await fetch(this.endpoint, {
+                  method: 'POST',
+                  headers,
+                  body: JSON.stringify({
+                    model: this.model,
+                    messages: minimal,
+                    stream: false,
+                    max_tokens: Math.min(256, this.maxReply),
+                    temperature: 0.7
+                  }),
+                  agent
+                });
+                if (res.ok) {
+                  const data2 = await res.json();
+                  aiText = (data2 && data2.choices && data2.choices[0] && data2.choices[0].message && data2.choices[0].message.content) || '';
+                  this.lastCall = {
+                    when: startedRetry,
+                    elapsed_ms: Date.now() - startedRetry,
+                    status: res.status,
+                    ok: true,
+                    payload_bytes: jsonSizeOf({ model: this.model, messages: minimal, stream: false, max_tokens: Math.min(256, this.maxReply), temperature: 0.7 }),
+                    messages_count: minimal.length,
+                    history_pairs_count: Array.isArray(historyPairs) ? historyPairs.length : null,
+                    note: 'retry-minimal-after-non-ok'
+                  };
+                } else {
+                  try {
+                    const txt2 = await res.text();
+                    console.log('AiOracle HTTP retry non-OK:', res.status, (txt2 || '').slice(0, 200));
+                  } catch(_) {}
+                  aiText = 'Sorry, the AI endpoint failed.';
+                  this.lastCall = {
+                    when: startedRetry,
+                    elapsed_ms: Date.now() - startedRetry,
+                    status: res.status,
+                    ok: false,
+                    payload_bytes: jsonSizeOf({ model: this.model, messages: minimal, stream: false, max_tokens: Math.min(256, this.maxReply), temperature: 0.7 }),
+                    messages_count: minimal.length,
+                    history_pairs_count: Array.isArray(historyPairs) ? historyPairs.length : null,
+                    note: 'retry-minimal-non-ok'
+                  };
+                }
+              } catch(_) {
+                aiText = 'Sorry, the AI endpoint failed.';
+              }
             }
           } catch(e) {
-            // On fetch/HTTP error, drop inflight to avoid indefinite skipping and continue loop
-            this.inflight.delete(inflightKey);
-            throw e;
+            // Transport error (endpoint down/unreachable). Retry once with minimal context and backoff
+            try {
+              await this.sleep(250);
+              const headers2 = { ...headers };
+              const minimal = [
+                { role: 'system', content: 'Be brief and helpful.' },
+                { role: 'user', content: (prompt || '').slice(0, 2000) }
+              ];
+              // New agent for retry as well
+              let agent2;
+              try {
+                const u2 = new URL(this.endpoint);
+                if (typeof process !== 'undefined' && process.versions && process.versions.node) {
+                  if (u2.protocol === 'https:') {
+                    const httpsMod2 = await import('https');
+                    agent2 = new (httpsMod2.Agent || httpsMod2.default?.Agent || httpsMod2?.global?.Agent || httpsMod2.Agent)({ keepAlive: false });
+                  } else {
+                    const httpMod2 = await import('http');
+                    agent2 = new (httpMod2.Agent || httpMod2.default?.Agent || httpMod2?.global?.Agent || httpMod2.Agent)({ keepAlive: false });
+                  }
+                }
+              } catch(_) { agent2 = undefined }
+              const startedRetry2 = Date.now();
+              const res2 = await fetch(this.endpoint, {
+                method: 'POST',
+                headers: headers2,
+                body: JSON.stringify({
+                  model: this.model,
+                  messages: minimal,
+                  stream: false,
+                  max_tokens: Math.min(256, this.maxReply),
+                  temperature: 0.7
+                }),
+                agent: agent2
+              });
+              if (res2.ok) {
+                const data3 = await res2.json();
+                aiText = (data3 && data3.choices && data3.choices[0] && data3.choices[0].message && data3.choices[0].message.content) || '';
+                this.lastCall = {
+                  when: startedRetry2,
+                  elapsed_ms: Date.now() - startedRetry2,
+                  status: res2.status,
+                  ok: true,
+                  payload_bytes: JSON.stringify({ model: this.model, messages: minimal, stream: false, max_tokens: Math.min(256, this.maxReply), temperature: 0.7 }).length,
+                  messages_count: minimal.length,
+                  history_pairs_count: Array.isArray(historyPairs) ? historyPairs.length : null,
+                  note: 'transport-retry-minimal-ok'
+                };
+              } else {
+                aiText = 'Sorry, the AI endpoint failed.';
+                this.lastCall = {
+                  when: startedRetry2,
+                  elapsed_ms: Date.now() - startedRetry2,
+                  status: res2.status,
+                  ok: false,
+                  payload_bytes: JSON.stringify({ model: this.model, messages: minimal, stream: false, max_tokens: Math.min(256, this.maxReply), temperature: 0.7 }).length,
+                  messages_count: minimal.length,
+                  history_pairs_count: Array.isArray(historyPairs) ? historyPairs.length : null,
+                  note: 'transport-retry-minimal-non-ok'
+                };
+              }
+            } catch(_) {
+              // Provide a graceful fallback reply instead of stalling the queue
+              aiText = 'Sorry, the AI endpoint is unreachable.';
+              this.lastCall = {
+                when: Date.now(),
+                elapsed_ms: null,
+                ok: false,
+                error: { name: e?.name || 'Error', message: e?.message || String(e) },
+                note: 'transport-exception'
+              };
+            }
           }
 
           // Post back to public chat, addressing the tagger's nick if set, else public key

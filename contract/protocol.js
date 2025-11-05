@@ -32,6 +32,7 @@ class AiChatProtocol extends Protocol {
         console.log('- /diag_ping | TEMP: ping AI endpoint configured in the ai feature');
         console.log('- /diag_inflight | TEMP: show inflight seqs and likely blocking item');
         console.log('- /fix_fast_forward [--seq <n>] | TEMP: advance process pointer to n (admin)');
+        console.log('- /diag_ai_last | TEMP: show last AI call diagnostics (oracle only)');
     }
 
     async customCommand(input) {
@@ -55,6 +56,10 @@ class AiChatProtocol extends Protocol {
                 await this.#diagInflight();
                 return;
             }
+            if (trimmed.startsWith('/diag_ai_last')) {
+                await this.#diagAiLast();
+                return;
+            }
             if (trimmed.startsWith('/fix_fast_forward')) {
                 const args = this.parseArgs(trimmed);
                 await this.#fixFastForward(args);
@@ -62,6 +67,33 @@ class AiChatProtocol extends Protocol {
             }
         } catch (e) {
             console.log('TEMP DIAG error:', e?.message || e);
+        }
+    }
+
+    async #diagAiLast(){
+        try {
+            const adminObj = await this.peer.base.view.get('admin');
+            const admin = adminObj ? adminObj.value : null;
+            const isOraclePeer = !!admin && admin === this.peer.wallet.publicKey && !!this.peer.base.writable;
+            if (!isOraclePeer) {
+                console.log('TEMP DIAG ai_last: not the oracle peer (admin+writable).');
+                return;
+            }
+            const aiFeat = this.features?.ai;
+            if (!aiFeat) {
+                console.log('TEMP DIAG ai_last: ai feature not loaded on this peer.');
+                return;
+            }
+            const lc = aiFeat.lastCall || null;
+            console.log('===== TEMP DIAG: AI LAST =====');
+            if (!lc) {
+                console.log('No AI call recorded yet.');
+            } else {
+                try { console.log(JSON.stringify(lc)); } catch(_) { console.log(lc); }
+            }
+            console.log('================================');
+        } catch(e){
+            console.log('TEMP DIAG ai_last failed:', e?.message || e);
         }
     }
 
@@ -73,6 +105,7 @@ class AiChatProtocol extends Protocol {
             const admin = adminObj ? adminObj.value : null;
             const isAdmin = (admin && me && admin === me);
             const writable = !!this.peer.base.writable;
+            const oraclePeer = !!(isAdmin && writable);
             const nowLocal = (typeof Date !== 'undefined') ? Date.now() : null;
             const ctObj = await this.peer.base.view.get('currentTime');
             const currentTime = ctObj ? ctObj.value : null;
@@ -93,7 +126,7 @@ class AiChatProtocol extends Protocol {
 
             console.log('===== TEMP DIAG: STATE =====');
             console.log('me:', me);
-            console.log('admin:', admin, '| isAdmin:', isAdmin, '| writable:', writable);
+            console.log('admin:', admin, '| isAdmin:', isAdmin, '| writable:', writable, '| oracle_peer:', oraclePeer);
             console.log('currentTime:', currentTime, '| delta_local_ms:', ctDelta);
             console.log('message_seq:', messageSeq, '| process_seq:', processSeq, '| backlog:', backlog);
             console.log('next_pending_key:', 'chat/pending/' + next);
@@ -143,12 +176,24 @@ class AiChatProtocol extends Protocol {
     async #diagPing(){
         // TEMP DIAG: quick ping to AI endpoint
         try {
+            // Only the oracle peer (admin + writable) should ever call the model endpoint.
+            const adminObj = await this.peer.base.view.get('admin');
+            const admin = adminObj ? adminObj.value : null;
+            const isOraclePeer = !!admin && admin === this.peer.wallet.publicKey && !!this.peer.base.writable;
+            if (!isOraclePeer) {
+                console.log('TEMP DIAG ping: not the oracle peer (admin+writable). Endpoint calls run only on the oracle.');
+                return;
+            }
             const aiFeat = this.features?.ai;
-            const endpoint = aiFeat?.endpoint || 'http://127.0.0.1:8000/v1/chat/completions';
-            const model = aiFeat?.model || 'gpt-oss-120b-fp16';
-            console.log('TEMP DIAG ping:', endpoint, 'model:', model);
+            if (!aiFeat) {
+                console.log('TEMP DIAG ping: ai feature not loaded on this peer (only admin starts features).');
+                return;
+            }
+            const endpoint = aiFeat.endpoint;
+            const model = aiFeat.model;
+            console.log('TEMP DIAG ping (oracle):', endpoint, 'model:', model);
             const headers = { 'Content-Type': 'application/json' };
-            if (aiFeat?.apiKey) {
+            if (aiFeat.apiKey) {
                 const keyHeader = (aiFeat.apiKeyHeader || 'Authorization');
                 headers[keyHeader] = (String(keyHeader).toLowerCase() === 'authorization' && aiFeat.apiKeyScheme)
                     ? `${aiFeat.apiKeyScheme} ${aiFeat.apiKey}`
@@ -159,11 +204,8 @@ class AiChatProtocol extends Protocol {
                 headers,
                 body: JSON.stringify({ model, messages: [{ role: 'user', content: 'ping' }], max_tokens: 1 })
             });
-            if (res.ok) {
-                console.log('TEMP DIAG ping: OK', res.status);
-            } else {
-                console.log('TEMP DIAG ping: FAIL status', res.status);
-            }
+            if (res.ok) console.log('TEMP DIAG ping: OK', res.status);
+            else console.log('TEMP DIAG ping: FAIL status', res.status);
         } catch(e){
             console.log('TEMP DIAG ping error:', e?.message || e);
         }

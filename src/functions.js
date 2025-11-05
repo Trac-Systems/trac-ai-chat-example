@@ -1,28 +1,51 @@
 /** @typedef {import('pear-interface')} */
 export function getStorePath(){
     let store_path = '';
-    if(typeof process !== "undefined" ) {
-        if(process.argv[27] !== undefined){
-            const args = JSON.parse(process.argv[27]);
-            if(args.flags.store !== undefined){
-                store_path = args.flags.store;
+
+    // Prefer Pear desktop/runtime args if available (desktop mode)
+    try {
+        const pear = (typeof global !== 'undefined' && global.Pear)
+            || (typeof globalThis !== 'undefined' && globalThis.Pear)
+            || (typeof window !== 'undefined' && window.Pear);
+        if (pear && pear.config) {
+            const pearArgs = Array.isArray(pear.config.args) ? pear.config.args : [];
+            if (pearArgs.length > 0 && typeof pearArgs[0] === 'string' && pearArgs[0] !== '') {
+                store_path = pearArgs[0];
+            } else if (typeof pear.config.storage === 'string' && pear.config.storage !== '') {
+                store_path = pear.config.storage;
             }
         }
-        if(store_path === '' &&
-            process.argv[2] !== undefined &&
-            process.argv[2].startsWith('--user-data-dir=')){
-            store_path = process.argv[2].split('=')[1];
-        }
+    } catch(_) {}
+
+    // Fallback to process argv (terminal mode)
+    if(store_path === '' && typeof process !== "undefined" && Array.isArray(process.argv)) {
+        // Legacy Pear JSON injection (keep for compatibility if present)
+        try {
+            if(process.argv[27] !== undefined){
+                const args = JSON.parse(process.argv[27]);
+                if(args && args.flags && typeof args.flags.store === 'string' && args.flags.store !== ''){
+                    store_path = args.flags.store;
+                }
+            }
+        } catch(_) {}
+
+        // Explicit user data dir flag anywhere in argv
         if(store_path === ''){
-            store_path = process.argv[2];
+            const ud = process.argv.find(a => typeof a === 'string' && a.startsWith('--user-data-dir='));
+            if(ud){
+                store_path = ud.split('=')[1];
+            }
         }
-    } else if(global.Pear !== undefined){
-        if(global.Pear.config.args[0] !== undefined){
-            store_path = global.Pear.config.args[0];
-        } else {
-            store_path = global.Pear.config.storage;
+
+        // Positional arg (scan from end to catch desktop args positioning)
+        if(store_path === ''){
+            for (let i = process.argv.length - 1; i >= 2; i--) {
+                const a = process.argv[i];
+                if (typeof a === 'string' && a !== '' && a[0] !== '-') { store_path = a; break; }
+            }
         }
     }
+
     if(store_path === ''){
         throw new Error('No store path given.');
     }
