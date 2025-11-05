@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { html } from 'htm/react';
 import { createRoot } from 'react-dom/client';
-import { app, setChatStatus, setAutoAddWriters } from "./index.js";
+import { app, setChatStatus, setAutoAddWriters, setNick } from "./index.js";
 
 await app.ready();
 const peer = app.getPeer();
@@ -74,6 +74,7 @@ function usePeerState(peer){
   const [state, setState] = useState({
     loading: true,
     me: peer.wallet.publicKey,
+    myNick: '',
     admin: null,
     isAdmin: false,
     writable: !!peer.base.writable,
@@ -94,10 +95,15 @@ function usePeerState(peer){
       const adminVal = await api.getAdmin(true);
       const admin = typeof adminVal === 'string' ? adminVal : (adminVal?.value || null);
       const isAdmin = !!admin && admin === peer.wallet.publicKey;
+      let myNick = '';
+      try {
+        const nickVal = await api.getNick(peer.wallet.publicKey, true);
+        myNick = typeof nickVal === 'string' ? nickVal : (nickVal?.value || '');
+      } catch(_){}
       const chatEnabled = await api.getChatStatus(true);
       const autoAddWriters = await api.getAutoAddWritersStatus(true);
       const features = Object.keys(peer.protocol_instance.features || {});
-      setState(s => ({...s, admin, isAdmin, chatEnabled, autoAddWriters, features}));
+      setState(s => ({...s, admin, isAdmin, myNick, chatEnabled, autoAddWriters, features}));
     } catch(_){}
   })() }, []);
 
@@ -150,11 +156,19 @@ function usePeerState(peer){
     }
   }, []);
 
+  const refreshMyNick = useCallback(async () => {
+    try {
+      const nickVal = await api.getNick(peer.wallet.publicKey, true);
+      const myNick = typeof nickVal === 'string' ? nickVal : (nickVal?.value || '');
+      setState(s => ({ ...s, myNick }));
+    } catch(_){}
+  }, []);
+
   // Poll
   useInterval(() => { fetchMessages(); refreshDiag(); }, 1000);
 
   const incWindow = (delta = 64) => setState(s => ({ ...s, extraLoaded: Math.max(0, (s.extraLoaded||0) + delta) }));
-  return [state, setState, { fetchMessages, refreshDiag, incWindow }];
+  return [state, setState, { fetchMessages, refreshDiag, incWindow, refreshMyNick }];
 }
 
 function StatusBar({ state }){
@@ -166,12 +180,42 @@ function StatusBar({ state }){
     <div id="header">
       <div id="details">
         <div>
-          <b>Me:</b> ${shortAddr(state.me)} | <b>Admin:</b> ${state.isAdmin ? 'yes' : 'no'} | <b>Writable:</b> ${state.writable ? 'yes' : 'no'}
+          <b>Me:</b> ${shortAddr(state.me)}${state.myNick ? ` (${state.myNick})` : ''} | <b>Admin:</b> ${state.isAdmin ? 'yes' : 'no'} | <b>Writable:</b> ${state.writable ? 'yes' : 'no'}
         </div>
         <div>
           <b>Chat:</b> ${state.chatEnabled ? 'on' : 'off'} | <b>Auto-Add:</b> ${state.autoAddWriters ? 'on' : 'off'} | <b>Oracles:</b> ${oraclesLabel}
         </div>
       </div>
+    </div>
+  `;
+}
+
+function NickEditor({ state, actions }){
+  const [nick, setNickVal] = useState(state.myNick || '');
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState('');
+  useEffect(() => { setNickVal(state.myNick || ''); }, [state.myNick]);
+  const save = async () => {
+    const val = (nick || '').trim();
+    if (!val) { setMsg('Nick cannot be empty'); return; }
+    if (val.length > 32) { setMsg('Max 32 characters'); return; }
+    if (!state.chatEnabled) { setMsg('Chat is off; enable to change nick'); return; }
+    try {
+      setBusy(true); setMsg('');
+      const escaped = val.replace(/["\\]/g, '\\$&');
+      await setNick(`/set_nick --nick "${escaped}"`, actions.peer);
+      await actions.refreshMyNick();
+      setMsg('Saved');
+    } catch(e){
+      setMsg(e?.message || 'Failed');
+    } finally { setBusy(false); }
+  };
+  return html`
+    <div style=${{ margin: '.25rem 0 .75rem 0', display: 'flex', alignItems: 'center', gap: '.5rem' }}>
+      <label><b>Nickname:</b></label>
+      <input value=${nick} onInput=${e => setNickVal(e.target.value)} placeholder=${'Set your display name'} maxLength=${32} style=${{ padding: '.25rem .5rem' }} />
+      <button disabled=${busy || !state.chatEnabled} onClick=${save}>Save</button>
+      ${msg ? html`<span style=${{ color: msg === 'Saved' ? '#6c6' : 'tomato' }}>${msg}</span>` : null}
     </div>
   `;
 }
@@ -394,6 +438,7 @@ function ChatApp(){
   return html`
     <div id="chat">
       ${html`<${StatusBar} state=${state} />`}
+      ${html`<${NickEditor} state=${state} actions=${{ peer, refreshMyNick: fns.refreshMyNick }} />`}
       ${html`<${AdminPanel} state=${state} actions=${{ peer, refresh: refreshAll }} />`}
       <div style=${{ marginBottom: '.5rem' }}>
         <button onClick=${async () => { fns.incWindow(64); await fns.fetchMessages(); }} title="Load older messages">Load older</button>
