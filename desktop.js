@@ -120,23 +120,53 @@ function usePeerState(peer){
         if (isNaN(messageCount)) messageCount = 0;
         // Indices are 0-based in contract storage: msg/0..msg/(msgl-1)
         const windowSize = Math.max(1, Math.min(1024, (state.historyWindow || 64) + (state.extraLoaded || 0)));
-        let start = Math.max(0, messageCount - windowSize);
-        const items = [];
-        for (let i = start; i < messageCount; i++) {
-          let m = null;
-          try { m = await api.getMessage(i, false); } catch(_) { m = null }
-          if (m && m.dispatch && m.dispatch.msg !== undefined) m = m.dispatch;
+        const targetStart = Math.max(0, messageCount - windowSize);
+        const current = state.messages || [];
+        const have = current.length;
+        const currentStart = have > 0 ? current[0].id : null;
+        const currentEnd = have > 0 ? current[have - 1].id : null;
+
+        // No change in total and start index — skip heavy work
+        if (messageCount === state.lastFetched && currentStart === targetStart) {
+          return;
+        }
+
+        let items = current.slice();
+        // 1) Append new items if the log grew
+        if (messageCount > state.lastFetched) {
+          for (let i = state.lastFetched; i < messageCount; i++) {
+            let m = null;
+            try { m = await api.getMessage(i, false); } catch(_) { m = null }
+            if (m && m.dispatch && m.dispatch.msg !== undefined) m = m.dispatch;
           if (m && m.msg !== undefined) {
-            let ts = null;
-            try { const t = await peer.base.view.get('msgts/' + i); ts = t && typeof t.value === 'number' ? t.value : null; } catch(_) {}
-            items.push({ id: i, msg: m.msg, address: m.address, attachments: m.attachments || [], ts });
+            items.push({ id: i, msg: m.msg, address: m.address, attachments: m.attachments || [], ts: null });
           }
+          }
+        }
+        // 2) Prepend older items if window expanded to the left
+        if (currentStart === null || targetStart < currentStart) {
+          const from = targetStart;
+          const to = (currentStart === null) ? (messageCount - 1) : (currentStart - 1);
+          const older = [];
+          for (let i = from; i <= to; i++) {
+            let m = null;
+            try { m = await api.getMessage(i, false); } catch(_) { m = null }
+            if (m && m.dispatch && m.dispatch.msg !== undefined) m = m.dispatch;
+            if (m && m.msg !== undefined) {
+              older.push({ id: i, msg: m.msg, address: m.address, attachments: m.attachments || [], ts: null });
+            }
+          }
+          items = older.concat(items);
+        }
+        // 3) Trim to target window from the right if needed
+        if (items.length > windowSize) {
+          items = items.slice(-windowSize);
         }
         setState(s => ({...s, messageCount, messages: items, lastFetched: messageCount }));
       } catch(e){
         // ignore fetch errors to keep UI alive
       }
-  }, [state.historyWindow, state.extraLoaded]);
+  }, [state.historyWindow, state.extraLoaded, state.messages, state.lastFetched]);
 
   // Diag snapshot (contract-specific pointers)
   const refreshDiag = useMemo(() => {
@@ -164,8 +194,9 @@ function usePeerState(peer){
     } catch(_){}
   }, []);
 
-  // Poll
-  useInterval(() => { fetchMessages(); refreshDiag(); }, 1000);
+  // Poll: messages more frequently, diagnostics less frequently
+  useInterval(() => { fetchMessages(); }, 1200);
+  useInterval(() => { refreshDiag(); }, 2500);
 
   const incWindow = (delta = 64) => setState(s => ({ ...s, extraLoaded: Math.max(0, (s.extraLoaded||0) + delta) }));
   return [state, setState, { fetchMessages, refreshDiag, incWindow, refreshMyNick }];
@@ -176,6 +207,7 @@ function StatusBar({ state }){
   const oraclesLabel = oraclePeer
     ? (state.features && state.features.length ? state.features.join(', ') + ' (local)' : 'none (local)')
     : 'none (local)';
+
   return html`
     <div id="header">
       <div id="details">
@@ -233,6 +265,7 @@ function fmtTime(ts){
 function MessageList({ messages, nicks, renderMarkdown }){
   const listRef = useRef(null);
   const bottomRef = useRef(null);
+  const htmlCacheRef = useRef(new Map()); // id -> rendered HTML (bounded to visible messages)
   const [autoFollow, setAutoFollow] = useState(true);
   const [showNew, setShowNew] = useState(false);
   const atBottom = (el) => (el.scrollHeight - el.scrollTop - el.clientHeight) <= 100;
@@ -263,26 +296,8 @@ function MessageList({ messages, nicks, renderMarkdown }){
     return () => el.removeEventListener('scroll', onScroll);
   }, []);
 
-  // Use IntersectionObserver to robustly detect when the bottom sentinel is visible (works across resizes)
-  useEffect(() => {
-    const root = listRef.current;
-    const target = bottomRef.current;
-    if (!root || !target || typeof IntersectionObserver === 'undefined') return;
-    const obs = new IntersectionObserver((entries) => {
-      for (const e of entries) {
-        if (e.target === target) {
-          if (e.isIntersecting) {
-            setAutoFollow(true);
-            setShowNew(false);
-          } else {
-            setAutoFollow(false);
-          }
-        }
-      }
-    }, { root, threshold: [0, 0.01, 0.1, 1] });
-    obs.observe(target);
-    return () => { try { obs.disconnect(); } catch(_){} };
-  }, [listRef.current, bottomRef.current]);
+  // Removed IntersectionObserver to prevent renderer heap growth in long sessions.
+  // Scroll listener + resize handler cover auto-follow behavior sufficiently.
 
   // On window resize, if following (or already at bottom), re-scroll to sentinel
   useEffect(() => {
@@ -299,6 +314,20 @@ function MessageList({ messages, nicks, renderMarkdown }){
     window.addEventListener('resize', handler);
     return () => window.removeEventListener('resize', handler);
   }, [autoFollow]);
+  // Prune HTML cache to current message ids
+  useEffect(() => {
+    try {
+      const ids = new Set(messages.map(m => m.id));
+      for (const key of Array.from(htmlCacheRef.current.keys())) {
+        if (!ids.has(key)) htmlCacheRef.current.delete(key);
+      }
+      if (htmlCacheRef.current.size > 320) {
+        const toDrop = htmlCacheRef.current.size - 256;
+        let dropped = 0;
+        for (const key of htmlCacheRef.current.keys()) { htmlCacheRef.current.delete(key); if (++dropped >= toDrop) break; }
+      }
+    } catch(_){}
+  }, [messages]);
   const jump = () => {
     const el = listRef.current;
     if (!el) return;
@@ -317,7 +346,7 @@ function MessageList({ messages, nicks, renderMarkdown }){
               ${item.ts ? html`<span style=${{ color: '#7aa93f', marginLeft: '.5rem' }}>[${fmtTime(item.ts)}]</span>` : null}
             </div>
             ${renderMarkdown
-              ? html`<div dangerouslySetInnerHTML=${{ __html: mdToHtml(item.msg) }} />`
+              ? html`<div dangerouslySetInnerHTML=${{ __html: (function(){ const c = htmlCacheRef.current; if (c.has(item.id)) return c.get(item.id); const v = mdToHtml(item.msg); c.set(item.id, v); return v; })() }} />`
               : html`<div style=${{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>${item.msg}</div>`}
           </div>
         `)}
@@ -402,20 +431,40 @@ function ChatApp(){
   const [state, setState, fns] = usePeerState(peer);
   const [nicks, setNicks] = useState({});
   const [renderMarkdown, setRenderMarkdown] = useState(true);
+  const nickCacheRef = useRef(new Map()); // address -> nick (bounded cache)
 
-  // Resolve nicks for visible messages
+  // Resolve nicks for visible messages, with caching to avoid repeated gets
   useEffect(() => { (async () => {
-    const map = {};
-    for (const m of state.messages) {
-      if (!map[m.address]) {
-        try {
-          const res = await api.getNick(m.address, true);
-          if (typeof res === 'string') map[m.address] = res;
-          else if (res && res.value) map[m.address] = res.value;
-        } catch(_){}
+    try {
+      const cache = nickCacheRef.current;
+      const addrs = [];
+      for (const m of state.messages) {
+        if (typeof m.address === 'string') addrs.push(m.address);
       }
-    }
-    setNicks(map);
+      // Unique current addresses
+      const uniq = Array.from(new Set(addrs));
+      // Fetch only for addresses not in cache
+      const missing = uniq.filter(a => !cache.has(a));
+      if (missing.length > 0) {
+        for (const a of missing) {
+          try {
+            const res = await api.getNick(a, true);
+            const nick = typeof res === 'string' ? res : (res && res.value ? res.value : '');
+            if (nick) cache.set(a, nick);
+            else cache.set(a, '');
+            // Bound cache size to avoid unbounded growth (simple FIFO discard)
+            if (cache.size > 512) {
+              const firstKey = cache.keys().next().value;
+              cache.delete(firstKey);
+            }
+          } catch(_) { cache.set(a, ''); }
+        }
+      }
+      // Build map only for visible messages from cache
+      const visible = {};
+      for (const a of uniq) { if (cache.has(a) && cache.get(a)) visible[a] = cache.get(a); }
+      setNicks(visible);
+    } catch(_){}
   })() }, [state.messages.length]);
 
   async function sendMessage(text){
@@ -430,6 +479,7 @@ function ChatApp(){
       throw e;
     }
   }
+
 
   const refreshAll = async () => {
     await Promise.all([fns.fetchMessages(), fns.refreshDiag()]);

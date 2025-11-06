@@ -120,6 +120,20 @@
     <pear-ctrl></pear-ctrl>
 </div>
 <div id="root">Please wait, loading...</div>
+<script>
+  // Ensure React/ReactDOM load production builds in the renderer
+  (function(){
+    try {
+      const g = typeof globalThis !== 'undefined' ? globalThis : window;
+      g.process = g.process || {};
+      g.process.env = g.process.env || {};
+      g.process.env.NODE_ENV = 'production';
+      // Also disable DevTools hooks to avoid extra retention in long sessions
+      g.__REACT_DEVTOOLS_GLOBAL_HOOK__ = g.__REACT_DEVTOOLS_GLOBAL_HOOK__ || {};
+      g.__REACT_DEVTOOLS_GLOBAL_HOOK__.isDisabled = true;
+    } catch(_){}
+  })();
+  </script>
 <script
         type="module"
         src="./desktop.js"
